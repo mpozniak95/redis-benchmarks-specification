@@ -1,0 +1,119 @@
+version: 0.4
+name: memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-repl-compression-03
+description: |
+  Steady-state replication benchmark with client-level replication compression
+  enabled (repl-compression 3, i.e. zstd level 3) on BOTH master and replica.
+
+  100%-writes traffic on the master (uniform-random SET overwrites of a fully
+  preloaded 3M-key keyspace of 1024B random values, ~3 GB resident) while a single
+  replica passively consumes the replication stream. Every measured SET is
+  propagated, so the compress/decompress wrappers on the replication write/read
+  path are on the critical path for the whole 180s window. This is the cell that
+  quantifies the compressor's cost and win under normal load; the full-sync
+  sibling (memtier_benchmark-20Mkeys-load-string-with-1KiB-values-replica-only-repl-compression-03)
+  covers the sync path, where the RDB payload is NOT compressed.
+
+  A/B/C triplet — same dataset, same client args, same topology, same binary,
+  differing only in the repl-compression level:
+    -repl-compression-00  compression off  (control / bandwidth+CPU baseline)
+    -repl-compression-03  zstd level 3     (this spec)
+    -repl-compression-09  zstd level 9     (higher-ratio, higher-CPU point)
+  Compare -03/-09 against -00 for: MasterReplicationBytesSent (bandwidth saved),
+  MasterCPUUtilizationPct / ReplicaCPUUtilizationPct (CPU paid), and Ops/sec
+  (per-op overhead of the wrappers). ReplicationCompressionRatio is reported
+  directly (uncompressed bytes / bytes on the wire; 1.0 when compression is off).
+
+  Reading the ratio honestly: memtier does not generate a unique payload per
+  request — with -R each individual value is incompressible, but clients draw
+  from a small pool of buffers that share long common substrings, so zstd's
+  window matches *across* operations. The measured ratio is therefore an upper
+  bound on what a production stream of the same shape would achieve; treat it as
+  a regression signal (it should be stable run to run), not as a bandwidth
+  forecast. The CPU and Ops/sec deltas are not affected by this and are the
+  primary numbers to track.
+
+  Replica disconnect cascades are pinned away (client-output-buffer-limit
+  replica 2GB, repl-backlog-size 256mb) so a replica stall cannot force a
+  mid-run full resync; discard any datapoint with a nonzero
+  ReplicationFullSyncCountDuringBench. Note the compressor's own buffered data
+  counts towards the replica client's output-buffer accounting.
+
+  repl-compression-max-latency is left at its 100ms default: with continuous
+  write traffic the replica is never caught up, so frames are flushed by the
+  latency timer rather than by the caught-up flush in writeToReplica.
+
+  Requirements baked into this spec (both are silent-no-op traps):
+  - `repl-compression` is only honoured when redis is built with
+    BUILD_COMPRESSION=yes; otherwise it is forced to 0 at startup with a log
+    warning. Hence build-variants is restricted to the *-compression builders
+    (`dockerhub` is excluded too — upstream images do not know the config and
+    would refuse to start).
+  - The master only accepts the compression handshake when io-threads > 1
+    ("Replication compression is only enabled with IO threads"), so an
+    io-threads replica topology is used. The compressor runs on the IO thread
+    that serves the replica client.
+dbconfig:
+  # Preload BEFORE replicas spin up so the dataset transfers via one initial
+  # full sync and the measured phase is pure steady-state write traffic.
+  preload_before_replica: true
+  configuration-parameters:
+    save: '""'
+    maxmemory-policy: noeviction
+    rdbcompression: 'no'
+    repl-backlog-size: 256mb
+    client-output-buffer-limit: 'replica 2048mb 2048mb 120'
+    # Immutable config: it is applied as a startup argument to the primary and to
+    # every replica (the coordinator passes the same configuration-parameters to
+    # both), which is what the master's level-equality check requires.
+    repl-compression: '3'
+  check:
+    keyspacelen: 3000000
+  preload_tool:
+    run_image: redislabs/memtier_benchmark:edge
+    tool: memtier_benchmark
+    arguments: --data-size 1024 -R --ratio 1:0 -n allkeys --pipeline 50 --key-maximum
+      3000000 --key-pattern P:P --key-minimum 1 --hide-histogram -t 8 -c 25
+  resources:
+    requests:
+      memory: 6g
+  dataset_name: 3Mkeys-string-1KiB-size-randomdata
+  dataset_description: |
+    3 million string keys, each with a 1024-byte random (incompressible)
+    value (~3 GB dataset). Small enough that the initial full sync is short and
+    the run is dominated by the steady-state stream, large enough that
+    uniform-random overwrites keep touching cold keys.
+tested-commands:
+- set
+redis-topologies:
+- oss-standalone-01-replicas-04-io-threads
+build-variants:
+- gcc:15.2.0-amd64-debian-bookworm-compression
+- gcc:15.2.0-arm64-debian-bookworm-compression
+clientconfig:
+  run_image: redislabs/memtier_benchmark:edge
+  tool: memtier_benchmark
+  arguments: '"--data-size" "1024" -R --command "SET __key__ __data__" --command-key-pattern
+    R --key-minimum 1 --key-maximum 3000000 --distinct-client-seed --pipeline 10
+    -c 25 -t 8 --test-time 180 --hide-histogram'
+  resources:
+    requests:
+      cpus: '8'
+      memory: 1g
+tested-groups:
+- string
+priority: 17
+exporter:
+  redistimeseries:
+    timemetric: $."ALL STATS".Runtime."Start time"
+    metrics:
+    - $."ALL STATS".Totals."ReplicationFullSyncSeconds"
+    - $."ALL STATS".Totals."ReplicationFullSyncCountDuringBench"
+    - $."ALL STATS".Totals."MasterReplicationBytesSent"
+    - $."ALL STATS".Totals."MasterReplicationBytesUncompressed"
+    - $."ALL STATS".Totals."ReplicaReplicationBytesReceived"
+    - $."ALL STATS".Totals."ReplicaReplicationBytesDecompressed"
+    - $."ALL STATS".Totals."ReplicationCompressionRatio"
+    - $."ALL STATS".Totals."MasterCPUSeconds"
+    - $."ALL STATS".Totals."MasterCPUUtilizationPct"
+    - $."ALL STATS".Totals."ReplicaCPUSecondsPerReplica"
+    - $."ALL STATS".Totals."ReplicaCPUUtilizationPct"

@@ -1,0 +1,31 @@
+version: 0.1
+id: gcc:15.2.0-amd64-debian-bookworm-compression
+os: debian-bookworm
+arch: amd64
+compiler: "gcc"
+cpp_compiler: "g++"
+kind: docker
+build_image: gcc:15.2.0-bookworm
+run_image: gcc:15.2.0-bookworm
+description: "Same as gcc:15.2.0-amd64-debian-bookworm-default but built with
+              BUILD_COMPRESSION=yes, which links libzstd and compiles in the
+              replication-stream compression path (repl-compression). Required by the
+              *-repl-compression-* test suites: without USE_COMPRESSION the
+              repl-compression config is silently forced to 0 at startup, so those
+              suites would run with compression disabled and report a no-op as a pass.
+              gcc:15.2.0-bookworm already ships libzstd + zstd.h + the pkg-config file,
+              so no extra package install is needed."
+metadata:
+  compiler: "gcc"
+  compiler_version: "15.2.0"
+  os: debian-bookworm
+  arch: amd64
+
+# BUILD_COMPRESSION has to be passed on the make command line rather than through
+# the `env` block below: the builder only passes `env` into the build-stream
+# metadata, the build container itself is started with `command=build_command` and
+# no environment (see __builder__/builder.py).
+build_command: "sh -c 'make -j BUILD_COMPRESSION=yes'"
+
+env:
+  REDIS_CFLAGS: "-g -fno-omit-frame-pointer"

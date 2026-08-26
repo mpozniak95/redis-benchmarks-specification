@@ -41,6 +41,159 @@ def inject_replication_sync_metrics(
         return False
 
 
+# INFO fields that describe the replication stream and the process CPU cost of
+# serving it. The *_uncompressed_/*_decompressed_ counters are only emitted by
+# redis once they are nonzero, i.e. only when replication compression is active.
+REPLICATION_STREAM_STATS_FIELDS = (
+    "total_net_repl_output_bytes",
+    "total_net_repl_input_bytes",
+    "total_net_repl_uncompressed_bytes",
+    "total_net_repl_decompressed_bytes",
+)
+CPU_STATS_FIELDS = ("used_cpu_sys", "used_cpu_user")
+
+
+def collect_replication_stream_stats(redis_conns):
+    """Snapshot replication byte counters and process CPU time, summed over conns.
+
+    Pass a single role's connections (primaries or replicas) — the caller needs
+    the two roles apart, since it is the master that compresses and the replica
+    that decompresses. Unreachable servers contribute 0 rather than raising, so a
+    snapshot never aborts a benchmark.
+    """
+    snapshot = {field: 0.0 for field in REPLICATION_STREAM_STATS_FIELDS}
+    snapshot.update({field: 0.0 for field in CPU_STATS_FIELDS})
+    for redis_conn in redis_conns:
+        try:
+            stats_info = redis_conn.info("stats")
+            cpu_info = redis_conn.info("cpu")
+        except Exception as e:
+            logging.warning(
+                "Failed to collect replication stream stats from one server: {}".format(
+                    e
+                )
+            )
+            continue
+        for field in REPLICATION_STREAM_STATS_FIELDS:
+            snapshot[field] += float(stats_info.get(field, 0))
+        for field in CPU_STATS_FIELDS:
+            snapshot[field] += float(cpu_info.get(field, 0))
+    return snapshot
+
+
+def _stats_delta(before, after, field):
+    """Delta of one counter, clamped at 0 so a CONFIG RESETSTAT or a restarted
+    server mid-window shows up as 0 instead of a negative datapoint."""
+    if not before or not after:
+        return 0.0
+    return max(0.0, float(after.get(field, 0)) - float(before.get(field, 0)))
+
+
+def inject_replication_stream_metrics(
+    results_dict,
+    primary_stats_before,
+    primary_stats_after,
+    replica_stats_before,
+    replica_stats_after,
+    replica_count,
+    benchmark_duration_seconds=None,
+    repl_compression_level=0,
+):
+    """Inject replication bandwidth + CPU metrics into a memtier-style results_dict.
+
+    Adds, under results_dict["ALL STATS"]["Totals"], for the benchmark window:
+    - MasterReplicationBytesSent / ReplicaReplicationBytesReceived: bytes actually
+      on the wire (compressed, when compression is active)
+    - MasterReplicationBytesUncompressed / ReplicaReplicationBytesDecompressed:
+      bytes before compression / after decompression (0 when compression is off)
+    - ReplicationCompressionRatio: uncompressed / on-the-wire, 1.0 when off
+    - MasterCPUSeconds, ReplicaCPUSecondsPerReplica and the matching
+      *CPUUtilizationPct (needs benchmark_duration_seconds to be known)
+
+    repl_compression_level is the suite's configured level and is used only to
+    warn when a suite that asked for compression measured none — the usual cause
+    is a server built without BUILD_COMPRESSION=yes (the config is then forced to
+    0 at startup) or a master running with io-threads <= 1, both of which
+    otherwise look like a clean pass.
+
+    Returns True on success, False on failure. Safe to call with None or
+    non-dict results_dict (returns False).
+    """
+    if not isinstance(results_dict, dict):
+        return False
+    try:
+        if "ALL STATS" not in results_dict:
+            results_dict["ALL STATS"] = {}
+        if "Totals" not in results_dict["ALL STATS"]:
+            results_dict["ALL STATS"]["Totals"] = {}
+        totals = results_dict["ALL STATS"]["Totals"]
+
+        master_sent = _stats_delta(
+            primary_stats_before, primary_stats_after, "total_net_repl_output_bytes"
+        )
+        master_uncompressed = _stats_delta(
+            primary_stats_before,
+            primary_stats_after,
+            "total_net_repl_uncompressed_bytes",
+        )
+        replica_received = _stats_delta(
+            replica_stats_before, replica_stats_after, "total_net_repl_input_bytes"
+        )
+        replica_decompressed = _stats_delta(
+            replica_stats_before,
+            replica_stats_after,
+            "total_net_repl_decompressed_bytes",
+        )
+        totals["MasterReplicationBytesSent"] = master_sent
+        totals["MasterReplicationBytesUncompressed"] = master_uncompressed
+        totals["ReplicaReplicationBytesReceived"] = replica_received
+        totals["ReplicaReplicationBytesDecompressed"] = replica_decompressed
+        # Ratio is defined from the master's own counters so it stays meaningful
+        # with more than one replica; 1.0 means "nothing was compressed".
+        if master_uncompressed > 0 and master_sent > 0:
+            totals["ReplicationCompressionRatio"] = master_uncompressed / master_sent
+        else:
+            totals["ReplicationCompressionRatio"] = 1.0
+
+        master_cpu = sum(
+            _stats_delta(primary_stats_before, primary_stats_after, field)
+            for field in CPU_STATS_FIELDS
+        )
+        replica_cpu = sum(
+            _stats_delta(replica_stats_before, replica_stats_after, field)
+            for field in CPU_STATS_FIELDS
+        )
+        totals["MasterCPUSeconds"] = master_cpu
+        # Per replica, so the number is comparable across replica counts.
+        totals["ReplicaCPUSecondsPerReplica"] = (
+            replica_cpu / replica_count if replica_count > 0 else 0.0
+        )
+        if benchmark_duration_seconds:
+            totals["MasterCPUUtilizationPct"] = (
+                100.0 * master_cpu / benchmark_duration_seconds
+            )
+            totals["ReplicaCPUUtilizationPct"] = (
+                100.0
+                * totals["ReplicaCPUSecondsPerReplica"]
+                / benchmark_duration_seconds
+            )
+
+        if int(repl_compression_level) > 0 and master_uncompressed <= 0:
+            logging.error(
+                "Suite configured repl-compression={} but the master reports no "
+                "compressed replication bytes: the replication stream was NOT "
+                "compressed during this run. Check that the server was built with "
+                "BUILD_COMPRESSION=yes and that io-threads > 1 — the compression "
+                "metrics from this datapoint are meaningless.".format(
+                    repl_compression_level
+                )
+            )
+        return True
+    except Exception as e:
+        logging.warning("Failed to inject replication stream metrics: {}".format(e))
+        return False
+
+
 def generate_standalone_dragonfly_server_args(
     binary,
     port,

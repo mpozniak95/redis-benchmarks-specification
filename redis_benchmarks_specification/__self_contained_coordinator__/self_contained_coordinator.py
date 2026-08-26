@@ -637,7 +637,9 @@ from redis_benchmarks_specification.__self_contained_coordinator__.clients impor
     prepare_vector_db_benchmark_parameters,
 )
 from redis_benchmarks_specification.__self_contained_coordinator__.docker import (
+    collect_replication_stream_stats,
     generate_standalone_redis_server_args,
+    inject_replication_stream_metrics,
     inject_replication_sync_metrics,
     spin_up_redis_replicas,
     spin_docker_cluster_redis,
@@ -2204,6 +2206,22 @@ def process_self_contained_coordinator_stream(
                                         server_name=server_name,
                                     )
 
+                                # Snapshot the replication byte counters and process
+                                # CPU time here — after preload, before the benchmark
+                                # client starts — so the exported deltas cover only the
+                                # measured window. Snapshotting any earlier would fold
+                                # the preload's replication traffic into the numbers on
+                                # the (default) preload-after-replica path.
+                                primary_stats_before = None
+                                replica_stats_before = None
+                                if replica_count > 0:
+                                    primary_stats_before = (
+                                        collect_replication_stream_stats(primary_conns)
+                                    )
+                                    replica_stats_before = (
+                                        collect_replication_stream_stats(replica_conns)
+                                    )
+
                                 # Multi-tool clientconfigs suites (e.g. memtier +
                                 # bcast-listener) are gated behind a feature flag and
                                 # routed through the shared multi_tool engine. The
@@ -2866,6 +2884,49 @@ def process_self_contained_coordinator_stream(
                                         logging.info(
                                             "Injected ReplicationFullSyncCountDuringBench={} (backlog overflow during write workload)".format(
                                                 sync_full_during_benchmark
+                                            )
+                                        )
+
+                                # Replication bandwidth + CPU cost of serving the
+                                # stream over the measured window. This is what makes
+                                # the repl-compression tradeoff (bytes saved vs CPU
+                                # paid) visible; with compression off the compressed
+                                # byte counters stay 0 and the ratio is 1.0.
+                                if replica_count > 0:
+                                    repl_compression_level = 0
+                                    try:
+                                        repl_compression_level = int(
+                                            redis_configuration_parameters.get(
+                                                "repl-compression", 0
+                                            )
+                                        )
+                                    except (TypeError, ValueError, AttributeError):
+                                        pass
+                                    if inject_replication_stream_metrics(
+                                        results_dict,
+                                        primary_stats_before,
+                                        collect_replication_stream_stats(primary_conns),
+                                        replica_stats_before,
+                                        collect_replication_stream_stats(replica_conns),
+                                        replica_count,
+                                        benchmark_duration_seconds,
+                                        repl_compression_level,
+                                    ):
+                                        totals = results_dict["ALL STATS"]["Totals"]
+                                        logging.info(
+                                            "Injected replication stream metrics: "
+                                            "MasterReplicationBytesSent={:.0f} "
+                                            "MasterReplicationBytesUncompressed={:.0f} "
+                                            "ReplicationCompressionRatio={:.2f} "
+                                            "MasterCPUSeconds={:.2f} "
+                                            "ReplicaCPUSecondsPerReplica={:.2f}".format(
+                                                totals["MasterReplicationBytesSent"],
+                                                totals[
+                                                    "MasterReplicationBytesUncompressed"
+                                                ],
+                                                totals["ReplicationCompressionRatio"],
+                                                totals["MasterCPUSeconds"],
+                                                totals["ReplicaCPUSecondsPerReplica"],
                                             )
                                         )
                                 try:
