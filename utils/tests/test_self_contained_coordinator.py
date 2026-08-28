@@ -37,8 +37,10 @@ from utils.tests.test_data.api_builder_common import flow_1_and_2_api_builder_ch
 
 
 from redis_benchmarks_specification.__self_contained_coordinator__.docker import (
+    collect_replication_stream_stats,
     generate_standalone_redis_server_args,
     generate_cluster_redis_server_args,
+    inject_replication_stream_metrics,
     inject_replication_sync_metrics,
     spin_up_redis_replicas,
     spin_docker_cluster_redis,
@@ -99,6 +101,245 @@ def test_inject_replication_sync_metrics_count_only_during_bench():
     totals = results["ALL STATS"]["Totals"]
     assert totals["ReplicationFullSyncSeconds"] == 2.0
     assert totals["ReplicationFullSyncCountDuringBench"] == 5
+
+
+class _FakeRedisConn:
+    """Minimal stand-in for a redis connection returning canned INFO sections."""
+
+    def __init__(self, sections, raises=False):
+        self.sections = sections
+        self.raises = raises
+
+    def info(self, section):
+        if self.raises:
+            raise ConnectionError("server is gone")
+        return self.sections.get(section, {})
+
+
+def _conn(
+    repl_out=0, repl_in=0, uncompressed=0, decompressed=0, cpu_sys=0.0, cpu_user=0.0
+):
+    return _FakeRedisConn(
+        {
+            "stats": {
+                "total_net_repl_output_bytes": repl_out,
+                "total_net_repl_input_bytes": repl_in,
+                "total_net_repl_uncompressed_bytes": uncompressed,
+                "total_net_repl_decompressed_bytes": decompressed,
+            },
+            "cpu": {"used_cpu_sys": cpu_sys, "used_cpu_user": cpu_user},
+        }
+    )
+
+
+def test_collect_replication_stream_stats_sums_and_tolerates_failures():
+    snapshot = collect_replication_stream_stats(
+        [
+            _conn(repl_out=100, uncompressed=1000, cpu_sys=1.0, cpu_user=2.0),
+            _conn(repl_out=50, uncompressed=500, cpu_sys=0.5, cpu_user=1.0),
+            _FakeRedisConn({}, raises=True),
+        ]
+    )
+    assert snapshot["total_net_repl_output_bytes"] == 150
+    assert snapshot["total_net_repl_uncompressed_bytes"] == 1500
+    assert snapshot["used_cpu_sys"] == 1.5
+    assert snapshot["used_cpu_user"] == 3.0
+    # Counters redis omits when compression is off default to 0, not KeyError.
+    assert snapshot["total_net_repl_decompressed_bytes"] == 0
+
+
+def test_inject_replication_stream_metrics_compression_on():
+    """With compression active the ratio comes from the master's own counters and
+    the CPU deltas are normalized per replica and by the benchmark duration."""
+    results = {"ALL STATS": {"Totals": {"Ops/sec": 200000.0}}}
+    primary_before = collect_replication_stream_stats([_conn()])
+    primary_after = collect_replication_stream_stats(
+        [_conn(repl_out=1000, uncompressed=10000, cpu_sys=4.0, cpu_user=6.0)]
+    )
+    replica_before = collect_replication_stream_stats([_conn()])
+    replica_after = collect_replication_stream_stats(
+        [_conn(repl_in=1000, decompressed=10000, cpu_sys=1.0, cpu_user=3.0)]
+    )
+    ok = inject_replication_stream_metrics(
+        results,
+        primary_before,
+        primary_after,
+        replica_before,
+        replica_after,
+        1,
+        20.0,
+        3,
+    )
+    assert ok is True
+    totals = results["ALL STATS"]["Totals"]
+    assert totals["MasterReplicationBytesSent"] == 1000
+    assert totals["MasterReplicationBytesUncompressed"] == 10000
+    assert totals["ReplicaReplicationBytesReceived"] == 1000
+    assert totals["ReplicaReplicationBytesDecompressed"] == 10000
+    assert totals["ReplicationCompressionRatio"] == 10.0
+    assert totals["MasterCPUSeconds"] == 10.0
+    assert totals["ReplicaCPUSecondsPerReplica"] == 4.0
+    assert totals["MasterCPUUtilizationPct"] == 50.0
+    assert totals["ReplicaCPUUtilizationPct"] == 20.0
+    assert totals["Ops/sec"] == 200000.0
+
+
+def test_inject_replication_stream_metrics_compression_off():
+    """With compression off redis never emits the compressed byte counters, so
+    the ratio must be reported as 1.0 rather than dividing by zero."""
+    results = {}
+    before = collect_replication_stream_stats([_conn()])
+    primary_after = collect_replication_stream_stats(
+        [_conn(repl_out=5000, cpu_sys=1.0, cpu_user=1.0)]
+    )
+    replica_after = collect_replication_stream_stats([_conn(repl_in=5000)])
+    ok = inject_replication_stream_metrics(
+        results, before, primary_after, before, replica_after, 1, 10.0, 0
+    )
+    assert ok is True
+    totals = results["ALL STATS"]["Totals"]
+    assert totals["MasterReplicationBytesSent"] == 5000
+    assert totals["MasterReplicationBytesUncompressed"] == 0
+    assert totals["ReplicationCompressionRatio"] == 1.0
+
+
+def test_inject_replication_stream_metrics_counter_reset_is_clamped():
+    """A CONFIG RESETSTAT or a restarted server mid-window must not produce a
+    negative bandwidth datapoint."""
+    results = {}
+    before = collect_replication_stream_stats([_conn(repl_out=9000)])
+    after = collect_replication_stream_stats([_conn(repl_out=10)])
+    ok = inject_replication_stream_metrics(
+        results, before, after, before, after, 1, 10.0, 0
+    )
+    assert ok is True
+    assert results["ALL STATS"]["Totals"]["MasterReplicationBytesSent"] == 0.0
+
+
+def test_inject_replication_stream_metrics_no_duration_and_no_replicas():
+    """Without a known benchmark duration the utilization metrics are omitted,
+    and a zero replica count must not divide by zero."""
+    results = {}
+    before = collect_replication_stream_stats([_conn()])
+    after = collect_replication_stream_stats([_conn(repl_out=10, cpu_sys=1.0)])
+    ok = inject_replication_stream_metrics(
+        results, before, after, before, after, 0, None, 0
+    )
+    assert ok is True
+    totals = results["ALL STATS"]["Totals"]
+    assert "MasterCPUUtilizationPct" not in totals
+    assert "ReplicaCPUUtilizationPct" not in totals
+    assert totals["ReplicaCPUSecondsPerReplica"] == 0.0
+
+
+def test_inject_replication_stream_metrics_invalid_input():
+    assert inject_replication_stream_metrics(None, {}, {}, {}, {}, 1) is False
+    assert inject_replication_stream_metrics("not a dict", {}, {}, {}, {}, 1) is False
+
+
+def test_repl_compression_specs_config_requirements():
+    """The repl-compression specs only measure anything if three preconditions
+    hold, and all three are silent no-ops when broken:
+
+    1. repl-compression must be set in dbconfig configuration-parameters, so the
+       coordinator passes it as a startup argument to BOTH primary and replicas
+       (it is an immutable config and the master rejects a level mismatch).
+    2. every topology must be an io-threads replica topology — the master
+       refuses the compression handshake when io-threads <= 1.
+    3. build-variants must only list the *-compression builders, since a server
+       built without BUILD_COMPRESSION=yes forces repl-compression to 0 at
+       startup (and the dockerhub images do not know the config at all).
+    """
+    import glob
+
+    spec_paths = sorted(
+        glob.glob(
+            "./redis_benchmarks_specification/test-suites/*-repl-compression-*.yml"
+        )
+    )
+    # The A/B/C steady-state triplet plus the full-sync variant.
+    assert len(spec_paths) == 4, f"unexpected repl-compression specs: {spec_paths}"
+
+    topologies = get_topologies(
+        "./redis_benchmarks_specification/setups/topologies/topologies.yml"
+    )
+    levels_seen = set()
+    for path in spec_paths:
+        with open(path, "r") as yml_file:
+            cfg = yaml.safe_load(yml_file)
+        name = os.path.basename(path)
+        assert cfg["name"] == name[: -len(".yml")], f"{name}: name must match filename"
+
+        params = cfg["dbconfig"]["configuration-parameters"]
+        assert (
+            "repl-compression" in params
+        ), f"{name}: must pin repl-compression explicitly"
+        # A nonzero repl-compression corrupts the compressor on the default
+        # dual-channel full-sync path, so the specs pin repl-rdb-channel off.
+        # Keep it pinned (in every arm, so the control matches) until that is
+        # fixed, otherwise the runs never reach master_link_status:up.
+        assert params.get("repl-rdb-channel") == "no", (
+            f"{name}: must pin repl-rdb-channel 'no' -- the default breaks "
+            "replication when repl-compression > 0"
+        )
+        level = int(params["repl-compression"])
+        levels_seen.add(level)
+
+        for topology in cfg["redis-topologies"]:
+            assert topology in topologies, f"{name}: unknown topology {topology}"
+            redis_arguments = topologies[topology].get("redis_arguments", "")
+            assert (
+                "replicas" in topology
+            ), f"{name}: repl-compression specs need a replica topology, got {topology}"
+            assert "--io-threads" in redis_arguments, (
+                f"{name}: topology {topology} has io-threads <= 1, the master will "
+                "reject the compression handshake"
+            )
+
+        for build_variant in cfg["build-variants"]:
+            assert build_variant.endswith("-compression"), (
+                f"{name}: build variant {build_variant} is not compression-enabled; "
+                "repl-compression would be silently forced to 0"
+            )
+
+        exported = cfg["exporter"]["redistimeseries"]["metrics"]
+        for metric in [
+            "MasterReplicationBytesSent",
+            "MasterReplicationBytesUncompressed",
+            "ReplicaReplicationBytesReceived",
+            "ReplicationCompressionRatio",
+            "MasterCPUUtilizationPct",
+            "ReplicaCPUUtilizationPct",
+            "ReplicationFullSyncSeconds",
+        ]:
+            assert any(
+                metric in jsonpath for jsonpath in exported
+            ), f"{name}: {metric} is not exported, the KPI would be dropped"
+
+    # A control arm (level 0) is what the compressed arms' bandwidth/CPU deltas
+    # are measured against — without it the suite reports absolutes only.
+    assert 0 in levels_seen, "repl-compression specs must include a level-0 control"
+    assert len(levels_seen) >= 3, f"expected a level curve, got {sorted(levels_seen)}"
+
+
+def test_compression_builders_enable_build_compression():
+    """The *-compression builders must actually pass BUILD_COMPRESSION=yes on the
+    make command line: the builder starts the build container with
+    command=build_command and no environment, so the `env` block cannot carry it.
+    """
+    import glob
+
+    builder_paths = sorted(
+        glob.glob("./redis_benchmarks_specification/setups/builders/*-compression.yml")
+    )
+    assert len(builder_paths) == 2, f"expected amd64+arm64, got {builder_paths}"
+    for path in builder_paths:
+        with open(path, "r") as yml_file:
+            build_config = yaml.safe_load(yml_file)
+        assert build_config["id"] == os.path.basename(path)[: -len(".yml")]
+        assert "BUILD_COMPRESSION=yes" in build_config.get(
+            "build_command", ""
+        ), f"{path}: build_command must pass BUILD_COMPRESSION=yes"
 
 
 def test_preload_before_replica_flag_in_20m_spec():
@@ -167,6 +408,14 @@ def test_preload_before_replica_default_off():
         "memtier_benchmark-20Mkeys-load-string-with-1KiB-values-replica-only-parallel-fullsync-08-16cpu.yml",
         "memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10.yml",
         "memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-rate-limited-40Kops.yml",
+        # Replication-compression specs: the full-sync one needs the flag for the
+        # same reason as the 20M parent, and the steady-state triplet needs the
+        # dataset to arrive via one initial full sync so the measured window is
+        # pure steady-state stream traffic.
+        "memtier_benchmark-20Mkeys-load-string-with-1KiB-values-replica-only-repl-compression-03.yml",
+        "memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-repl-compression-00.yml",
+        "memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-repl-compression-03.yml",
+        "memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-repl-compression-09.yml",
     }
     assert (
         set(enabled_specs) == expected

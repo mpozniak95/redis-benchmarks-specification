@@ -1,0 +1,119 @@
+version: 0.4
+name: memtier_benchmark-20Mkeys-load-string-with-1KiB-values-replica-only-repl-compression-03
+description: |
+  Replication full-sync benchmark with client-level replication compression
+  enabled (repl-compression 3, i.e. zstd level 3) on BOTH master and replica.
+
+  Identical to memtier_benchmark-20Mkeys-load-string-with-1KiB-values-replica-only
+  except `repl-compression 3` and the topology/build-variant restrictions below,
+  so ReplicationFullSyncSeconds is directly comparable against that spec cell for
+  cell (the metric is measured during topology setup, before the benchmark client
+  starts, so it is unaffected by the client workload).
+
+  What this cell covers: the master accepts the replica's `REPLCONF compression 3`
+  handshake, the compressor/decompressor are allocated per replica client, the
+  full sync completes, and the link stays up while the compressed command stream
+  flows. It is the regression guard for the compression code paths on the full-sync
+  path, plus the wall-clock/CPU answer to "does turning the compressor on make a
+  20 GB full sync slower".
+
+  What this cell does NOT measure: bandwidth saved. Compression hooks the replica
+  *client write path* (writeToReplica), not the RDB payload, so the ~20 GB the
+  full sync transfers is NOT compressed; and this spec inherits the parent's
+  read-only measured phase (--ratio 0:1), which generates almost no replication
+  stream. Expect ReplicationCompressionRatio here to be near 1 and the byte
+  counters to be tiny. For the bandwidth/CPU tradeoff of the compressor under
+  real stream volume, use the steady-state siblings:
+  memtier_benchmark-3Mkeys-string-set-1KiB-pipeline-10-repl-compression-{00,03,09}.
+
+  Requirements baked into this spec (both are silent-no-op traps):
+  - `repl-compression` is only honoured when redis is built with
+    BUILD_COMPRESSION=yes; otherwise it is forced to 0 at startup with a log
+    warning. Hence build-variants is restricted to the *-compression builders
+    (`dockerhub` is excluded too — upstream images do not know the config and
+    would refuse to start).
+  - The master only accepts the compression handshake when io-threads > 1
+    ("Replication compression is only enabled with IO threads"), so only
+    io-threads replica topologies are listed. The compressor runs on the IO
+    thread that serves the replica client.
+
+  DEFECT FOUND BY THIS SPEC (2026-08-28, redis unstable @1c6fa3748): with the
+  default `repl-rdb-channel yes` (dual-channel full sync), a nonzero
+  repl-compression corrupts the master's compressor as soon as the RDB transfer
+  overlaps a non-trivial replication stream. The master logs
+  "zstd compress error: Src size is incorrect", destroys the replica's
+  compression state, the replica aborts the rdb-channel sync and retries
+  forever — master_link_status never reaches "up". Measured on redis-gnr at 3M
+  x 1KiB keys: repl-compression 0 syncs in 22.1s on the first attempt, while
+  repl-compression 3 failed 10/10 attempts with replica dbsize stuck at 0. It
+  reproduces at 3M keys and slips through at 500k, so it is dataset-size
+  dependent. `repl-rdb-channel no` syncs normally (22.6s), so this spec pins it
+  off in order to measure the compressor at all. Restore the default here once
+  the dual-channel interaction is fixed.
+dbconfig:
+  # Run preload BEFORE replicas spin up so the master->replica full sync
+  # transfers the 20 GB dataset (rather than syncing an empty primary
+  # and propagating writes via the replication stream). This is what
+  # makes ReplicationFullSyncSeconds a meaningful metric here.
+  preload_before_replica: true
+  configuration-parameters:
+    save: '""'
+    maxmemory-policy: noeviction
+    # Immutable config: it is applied as a startup argument to the primary and to
+    # every replica (the coordinator passes the same configuration-parameters to
+    # both), which is what the master's level-equality check requires.
+    repl-compression: '3'
+    # Pinned off: the default (yes) is incompatible with a nonzero
+    # repl-compression on this build -- see DEFECT FOUND BY THIS SPEC above.
+    repl-rdb-channel: 'no'
+  check:
+    keyspacelen: 20000000
+  preload_tool:
+    run_image: redislabs/memtier_benchmark:edge
+    tool: memtier_benchmark
+    arguments: --data-size 1024 --ratio 1:0 -n allkeys --pipeline 50 --key-maximum
+      20000000 --key-pattern P:P --key-minimum 1 --hide-histogram -t 8 -c 25
+  resources:
+    requests:
+      memory: 25g
+  dataset_name: 20Mkeys-string-1KiB-size
+  dataset_description: |
+    20 million string keys, each with a 1024-byte value (~20 GB dataset).
+    Sized to make replication full-sync take long enough (>30s) to measure
+    full-sync changes meaningfully.
+tested-commands:
+- set
+redis-topologies:
+- oss-standalone-01-replicas-04-io-threads
+- oss-standalone-01-replicas-16-io-threads
+build-variants:
+- gcc:15.2.0-amd64-debian-bookworm-compression
+- gcc:15.2.0-arm64-debian-bookworm-compression
+clientconfig:
+  run_image: redislabs/memtier_benchmark:edge
+  tool: memtier_benchmark
+  arguments: '"--data-size" "1024" --pipeline 10 --distinct-client-seed --ratio 0:1
+    --key-pattern R:R --key-minimum=1 --key-maximum 20000000 --test-time 30 -c 50
+    -t 4 --hide-histogram'
+  resources:
+    requests:
+      cpus: '4'
+      memory: 1g
+tested-groups:
+- string
+priority: 17
+exporter:
+  redistimeseries:
+    timemetric: $."ALL STATS".Runtime."Start time"
+    metrics:
+    - $."ALL STATS".Totals."ReplicationFullSyncSeconds"
+    - $."ALL STATS".Totals."ReplicationFullSyncCountDuringBench"
+    - $."ALL STATS".Totals."MasterReplicationBytesSent"
+    - $."ALL STATS".Totals."MasterReplicationBytesUncompressed"
+    - $."ALL STATS".Totals."ReplicaReplicationBytesReceived"
+    - $."ALL STATS".Totals."ReplicaReplicationBytesDecompressed"
+    - $."ALL STATS".Totals."ReplicationCompressionRatio"
+    - $."ALL STATS".Totals."MasterCPUSeconds"
+    - $."ALL STATS".Totals."MasterCPUUtilizationPct"
+    - $."ALL STATS".Totals."ReplicaCPUSecondsPerReplica"
+    - $."ALL STATS".Totals."ReplicaCPUUtilizationPct"
