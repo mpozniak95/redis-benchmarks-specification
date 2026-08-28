@@ -36,6 +36,20 @@ description: |
     ("Replication compression is only enabled with IO threads"), so only
     io-threads replica topologies are listed. The compressor runs on the IO
     thread that serves the replica client.
+
+  DEFECT FOUND BY THIS SPEC (2026-08-28, redis unstable @1c6fa3748): with the
+  default `repl-rdb-channel yes` (dual-channel full sync), a nonzero
+  repl-compression corrupts the master's compressor as soon as the RDB transfer
+  overlaps a non-trivial replication stream. The master logs
+  "zstd compress error: Src size is incorrect", destroys the replica's
+  compression state, the replica aborts the rdb-channel sync and retries
+  forever — master_link_status never reaches "up". Measured on redis-gnr at 3M
+  x 1KiB keys: repl-compression 0 syncs in 22.1s on the first attempt, while
+  repl-compression 3 failed 10/10 attempts with replica dbsize stuck at 0. It
+  reproduces at 3M keys and slips through at 500k, so it is dataset-size
+  dependent. `repl-rdb-channel no` syncs normally (22.6s), so this spec pins it
+  off in order to measure the compressor at all. Restore the default here once
+  the dual-channel interaction is fixed.
 dbconfig:
   # Run preload BEFORE replicas spin up so the master->replica full sync
   # transfers the 20 GB dataset (rather than syncing an empty primary
@@ -49,6 +63,9 @@ dbconfig:
     # every replica (the coordinator passes the same configuration-parameters to
     # both), which is what the master's level-equality check requires.
     repl-compression: '3'
+    # Pinned off: the default (yes) is incompatible with a nonzero
+    # repl-compression on this build -- see DEFECT FOUND BY THIS SPEC above.
+    repl-rdb-channel: 'no'
   check:
     keyspacelen: 20000000
   preload_tool:

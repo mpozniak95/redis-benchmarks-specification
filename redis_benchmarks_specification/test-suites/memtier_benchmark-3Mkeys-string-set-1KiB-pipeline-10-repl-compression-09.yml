@@ -21,6 +21,40 @@ description: |
 
   See the -03 sibling for the full rationale, including why the measured
   compression ratio is an upper bound with memtier-generated payloads.
+
+  DEFECT FOUND BY THIS SPEC (2026-08-28, redis unstable @1c6fa3748): with the
+  default `repl-rdb-channel yes` (dual-channel full sync), a nonzero
+  repl-compression corrupts the master's compressor as soon as the RDB transfer
+  overlaps a non-trivial replication stream. The master logs
+  "zstd compress error: Src size is incorrect", destroys the replica's
+  compression state, the replica aborts the rdb-channel sync and retries
+  forever — master_link_status never reaches "up". Measured on redis-gnr at 3M
+  x 1KiB keys: repl-compression 0 syncs in 22.1s on the first attempt, while
+  repl-compression 3 failed 10/10 attempts with replica dbsize stuck at 0. It
+  reproduces at 3M keys and slips through at 500k, so it is dataset-size
+  dependent. `repl-rdb-channel no` syncs normally (22.6s), so this spec pins it
+  off in order to measure the compressor at all. Restore the default here once
+  the dual-channel interaction is fixed.
+  OFFERED RATE IS FIXED (--rate-limiting 15000 x 20 connections = 300k ops/s).
+  This is not a throughput test and must not be run open-loop. Measured on
+  redis-gnr: unthrottled (-c 25 -t 8, pipeline 10) the master reaches ~820k
+  SET/s, which no single replica can apply -- the master offloads socket work to
+  its io-threads across 200 connections while the replica must read, parse AND
+  apply the whole stream on its single main thread. The replica falls behind,
+  overruns client-output-buffer-limit, gets killed and full-resyncs: 20 resyncs
+  inside a 180s window, replication output collapsing to ~33 MB/s of thrash
+  instead of ~860 MB/s of stream. Every KPI is then meaningless (master CPU is
+  dominated by 20 BGSAVEs, replica CPU *falls* as the level rises because the
+  replica does less useful work). Rate-limited to 300k ops/s the replica keeps up
+  exactly: 0 resyncs and 0 byte lag, verified up to 500k ops/s.
+
+  Because the rate is fixed, Ops/sec is set by the client and is NOT a signal
+  here -- it should read ~300k in every arm, and a shortfall means the arm could
+  not keep up and should be discarded. The per-op cost of the compress/decompress
+  wrappers shows up in the latency percentiles and in MasterCPUSeconds /
+  ReplicaCPUSecondsPerReplica per identical logical byte, which is the whole point
+  of pinning the rate: all three arms push the same logical bytes through the
+  replication path, so CPU and bytes-on-wire are directly comparable.
 dbconfig:
   # Preload BEFORE replicas spin up so the dataset transfers via one initial
   # full sync and the measured phase is pure steady-state write traffic.
@@ -35,6 +69,9 @@ dbconfig:
     # every replica (the coordinator passes the same configuration-parameters to
     # both), which is what the master's level-equality check requires.
     repl-compression: '9'
+    # Pinned off: the default (yes) is incompatible with a nonzero
+    # repl-compression on this build -- see DEFECT FOUND BY THIS SPEC above.
+    repl-rdb-channel: 'no'
   check:
     keyspacelen: 3000000
   preload_tool:
@@ -63,10 +100,10 @@ clientconfig:
   tool: memtier_benchmark
   arguments: '"--data-size" "1024" -R --command "SET __key__ __data__" --command-key-pattern
     R --key-minimum 1 --key-maximum 3000000 --distinct-client-seed --pipeline 10
-    -c 25 -t 8 --test-time 180 --hide-histogram'
+    -c 5 -t 4 --rate-limiting 15000 --test-time 180 --hide-histogram'
   resources:
     requests:
-      cpus: '8'
+      cpus: '4'
       memory: 1g
 tested-groups:
 - string

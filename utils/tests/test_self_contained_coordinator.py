@@ -274,6 +274,14 @@ def test_repl_compression_specs_config_requirements():
         assert (
             "repl-compression" in params
         ), f"{name}: must pin repl-compression explicitly"
+        # A nonzero repl-compression corrupts the compressor on the default
+        # dual-channel full-sync path, so the specs pin repl-rdb-channel off.
+        # Keep it pinned (in every arm, so the control matches) until that is
+        # fixed, otherwise the runs never reach master_link_status:up.
+        assert params.get("repl-rdb-channel") == "no", (
+            f"{name}: must pin repl-rdb-channel 'no' -- the default breaks "
+            "replication when repl-compression > 0"
+        )
         level = int(params["repl-compression"])
         levels_seen.add(level)
 
